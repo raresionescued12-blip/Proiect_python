@@ -1,0 +1,387 @@
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+import re
+import json
+import time
+import warnings
+from requests.adapters import HTTPAdapter, Retry
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+import mysql.connector
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3"
+
+LABELS = ["produse", "servicii", "contact", "necunoscut"]
+SKIP_KEYWORDS = ["cookie", "confidentialitate", "retur", "despre", "autor", "politica", "harta-site", ".pdf"]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+    "Accept-Language": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+    "Referer": "https://www.google.com/",
+    "Connection": "keep-alive"
+}
+
+DB_HOST = "127.0.0.1"
+DB_PORT = 3306
+DB_USER = "root"
+DB_PASS = "Test1@"
+DB_NAME = "webscrapping"
+
+HERE = Path(__file__).resolve().parent
+F_REZULTATE_LLAMACOPIE = HERE / "ClasificareSiteuri.json"
+
+
+def requests_retry_session(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504), session=None):
+    session = session or requests.Session()
+    retries = Retry(total=retries, read=retries, connect=retries, backoff_factor=backoff_factor, status_forcelist=status_forcelist, allowed_methods=False)
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _canon_netloc(netloc: str) -> str:
+    netloc = (netloc or "").strip().lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+def _norm_path_only(u: str) -> str:
+    u = (u or "").strip()
+    if not u:
+        return "/"
+    if not re.match(r"^https?://", u, re.I):
+        path = u if u.startswith("/") else "/" + u
+    else:
+        p = urlparse(u)
+        path = p.path or "/"
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path
+
+def _exact_key(u: str) -> tuple[str, str, str]:
+    u = (u or "").strip()
+    if not u:
+        return ("", "/", "")
+    if not re.match(r"^https?://", u, re.I):
+        u = "http://" + u
+    p = urlparse(u)
+    host = _canon_netloc(p.netloc)
+    path = _norm_path_only(u)
+    query = (p.query or "").strip()
+    return (host, path, query)
+
+def _exact_key_noquery(u: str) -> tuple[str, str, str]:
+    host, path, _ = _exact_key(u)
+    return (host, path, "")
+
+
+def load_ignore_sets_from_db():
+    path_prefixes = set()
+    exact_keys = set()
+    try:
+        conn = mysql.connector.connect(host=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASS, database=DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT adresa FROM `url` WHERE adresa IS NOT NULL AND adresa <> ''")
+        rows = cur.fetchall()
+        for (adresa,) in rows:
+            adresa = (adresa or "").strip()
+            if not adresa:
+                continue
+            if not re.match(r"^https?://", adresa, re.I) and adresa.startswith("/"):
+                pnorm = _norm_path_only(adresa)
+                if pnorm != "/":
+                    path_prefixes.add(pnorm)
+                continue
+            k1 = _exact_key(adresa)
+            k2 = _exact_key_noquery(adresa)
+            exact_keys.add(k1)
+            exact_keys.add(k2)
+        cur.close()
+        conn.close()
+        print(f"[INFO] De ignorat (DB): {len(path_prefixes)} prefixuri, {len(exact_keys)} chei exacte")
+    except Exception as e:
+        print(f"[WARN] Nu am putut incarca ignore list din DB: {e}")
+    return path_prefixes, exact_keys
+
+
+def preview_ignored_for_site(root_url, path_prefixes, exact_keys, limit=100):
+    host_curent = _canon_netloc(urlparse(root_url).netloc)
+    exact_curent = [k for k in exact_keys if k[0] == host_curent]
+    print(f"[i] Ignor (din DB - exact, domeniu curent): {len(exact_curent)}")
+    for host, path, query in exact_curent[:limit]:
+        full = f"https://{host}{path}" + (f"?{query}" if query else "")
+        print(f" Ignor (din DB - exact): {full}")
+    if len(exact_curent) > limit:
+        print(f" ... (+{len(exact_curent)-limit} alte URL-uri exacte)")
+    print(f"[i] Ignor (din DB - prefixuri): {len(path_prefixes)}")
+    for p in list(sorted(path_prefixes))[:limit]:
+        print(f" Ignor (din DB - prefix): {p}")
+    if len(path_prefixes) > limit:
+        print(f" ... (+{len(path_prefixes)-limit} alte prefixuri)")
+
+
+def should_ignore_url(u: str, path_prefixes: set, exact_keys: set) -> bool:
+    k = _exact_key(u)
+    k0 = _exact_key_noquery(u)
+    if k in exact_keys or k0 in exact_keys:
+        return True
+    path = _norm_path_only(u)
+    if path == "/":
+        return False
+    for pref in path_prefixes:
+        if path == pref or path.startswith(pref + "/"):
+            return True
+    return False
+
+
+def extract_text_from_tag(soup, tag_name):
+    tag = soup.find(tag_name)
+    return tag.get_text(separator=" ", strip=True) if tag else ""
+
+
+def get_header_footer_text(url):
+    html = fetch_page_content(url)
+    if not html:
+        return "", ""
+    soup = BeautifulSoup(html, "html.parser")
+    return extract_text_from_tag(soup, "header"), extract_text_from_tag(soup, "footer")
+
+
+def fetch_page_content(url):
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = requests_retry_session().get(url, headers=HEADERS, timeout=20, verify=False)
+            res.raise_for_status()
+            if len(res.text.strip()) > 200:
+                return res.text
+    except Exception:
+        pass
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            try:
+                page.wait_for_selector("a[href]", timeout=3000)
+            except Exception:
+                pass
+            html = page.content()
+            browser.close()
+            return html
+    except Exception as e:
+        print(f"[!] Nu am putut încărca cu Playwright {url}: {e}")
+        return ""
+
+
+def clean_page_content(html, header_text, footer_text):
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        tag.decompose()
+    text = soup.get_text(separator=" ")
+    text = re.sub(r"\s+", " ", text).strip()
+    if header_text:
+        text = text.replace(header_text, "")
+    if footer_text:
+        text = text.replace(footer_text, "")
+    return text
+
+
+def classify_page_rule_based(text: str, url: str) -> str:
+    u = url.lower()
+    t = text.lower()
+    if any(x in u for x in ["/contact", "/contacte", "/locatie", "/contact-us"]):
+        return "contact"
+    if any(x in u for x in ["/servicii", "/service", "/solutii", "/consultanta"]):
+        return "servicii"
+    if any(x in u for x in ["/produse", "/produs", "/catalog", "/categorie", "/shop", "/magazin"]):
+        return "produse"
+    contact_hits = 0
+    if re.search(r"\b[\w\.-]+@[\w\.-]+\.\w{2,}\b", t):
+        contact_hits += 1
+    if re.search(r"\b(\+?4?0[\s\-\.\)]?\d{2}[\s\-\.\)]?\d{3}[\s\-\.\)]?\d{3,4})\b", t):
+        contact_hits += 1
+    if any(k in t for k in ["program", "orar", "str.", "strada", "bucurești", "jud.", "sector", "facebook.com", "instagram.com", "linkedin.com"]):
+        contact_hits += 1
+    if contact_hits >= 2:
+        return "contact"
+    prod_kw = ["adauga in cos", "adaugă în coș", "cumpără", "pret", "lei", "oferta", "cod produs", "stoc", "filtrează", "sortare", "categorie", "brand"]
+    if sum(k in t for k in prod_kw) >= 2:
+        return "produse"
+    serv_kw = ["servicii", "soluții", "implementare", "mentenanță", "consultanță", "portofoliu", "proiecte", "ofertă personalizată"]
+    if sum(k in t for k in serv_kw) >= 2:
+        return "servicii"
+    return "necunoscut"
+
+
+def _call_ollama(prompt: str, timeout_sec: int = 90, retries: int = 2) -> str:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "options": {"num_predict": 64, "temperature": 0.0}}, timeout=timeout_sec)
+            r.raise_for_status()
+            data = r.json()
+            return (data.get("response") or "").strip()
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    raise last_err if last_err else RuntimeError("Unknown Ollama error")
+
+
+_label_cache = {}
+
+
+def classify_page_with_llama(text, url):
+    if "/contact" in url.lower():
+        return "contact"
+    path_key = _norm_path_only(url)
+    if path_key in _label_cache:
+        return _label_cache[path_key]
+    prompt = f"""
+Ai conținutul unei pagini web. Încadrează pagina strict într-una din opțiuni.
+Opțiunile sunt:
+- produse
+- servicii
+- contact
+- necunoscut
+
+Text (trunchiat la 2000 caractere):
+
+\"\"\" 
+{text[:2000]} 
+\"\"\" 
+
+Răspunde DOAR cu: produse, servicii, contact sau necunoscut.
+"""
+    try:
+        raw = _call_ollama(prompt, timeout_sec=60).lower()
+        label = next((l for l in LABELS if l in raw), None)
+        if not label:
+            label = classify_page_rule_based(text, url)
+        _label_cache[path_key] = label
+        return label
+    except Exception as e:
+        print(f"[!] Eroare Ollama: {e}")
+        return classify_page_rule_based(text, url)
+
+
+def extract_menu_links(root_url, path_prefixes, exact_keys):
+    html = fetch_page_content(root_url)
+    links = set()
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup.select("a[href]"):
+            href = tag.get("href")
+            if not href or href.startswith("#") or "javascript" in href.lower():
+                continue
+            full_url = urljoin(root_url, href)
+            if urlparse(full_url).netloc != urlparse(root_url).netloc:
+                continue
+            if any(kw in full_url.lower() for kw in SKIP_KEYWORDS):
+                continue
+            if should_ignore_url(full_url, path_prefixes, exact_keys):
+                continue
+            links.add(full_url.split("#")[0])
+    if len(links) < 5:
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(root_url, timeout=30000)
+                page.wait_for_selector("a[href]", timeout=5000)
+                anchors = page.query_selector_all("a[href]")
+                for a in anchors:
+                    href = a.get_attribute("href")
+                    if not href or href.startswith("#") or "javascript" in href.lower():
+                        continue
+                    full_url = urljoin(root_url, href)
+                    if urlparse(full_url).netloc != urlparse(root_url).netloc:
+                        continue
+                    if any(kw in full_url.lower() for kw in SKIP_KEYWORDS):
+                        continue
+                    if should_ignore_url(full_url, path_prefixes, exact_keys):
+                        continue
+                    links.add(full_url.split("#")[0])
+                browser.close()
+        except Exception as e:
+            print(f"[!] Playwright link extraction failed: {e}")
+    return list(links)
+
+
+def detect_contact_info(text):
+    text = text.lower()
+    found = 0
+    phone_patterns = [r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{3,4}\b", r"\b0\d{2}[-.\s]?\d{3}[-.\s]?\d{3,4}\b", r"\b\+?40[-.\s]?\d{2}[-.\s]?\d{3}[-.\s]?\d{3,4}\b"]
+    for p in phone_patterns:
+        if re.search(p, text):
+            found += 1
+            break
+    if re.search(r"\b[\w\.-]+@[\w\.-]+\.\w{2,4}\b", text):
+        found += 1
+    if any(k in text for k in ["str", "bucurești", "cluj", "jud", "sector", "timisoara", "iasi", "constanta"]):
+        found += 1
+    if any(s in text for s in ["facebook.com", "instagram.com", "linkedin.com", "twitter.com"]):
+        found += 1
+    return found >= 2
+
+
+def analyze_site(root_url):
+    path_prefixes, exact_keys = load_ignore_sets_from_db()
+    print(f"\nAnalizez: {root_url}")
+    preview_ignored_for_site(root_url, path_prefixes, exact_keys, limit=100)
+    header_text, footer_text = get_header_footer_text(root_url)
+    results = []
+    combined_text = (header_text + " " + footer_text).strip()
+    if detect_contact_info(combined_text):
+        results.append({"site": root_url, "url": root_url + "#footer", "categorie": "contact"})
+        print("  Am gasit informatii de contact în header/footer.")
+    links = extract_menu_links(root_url, path_prefixes, exact_keys)
+    if not links:
+        print(" Nu am găsit linkuri.")
+        return results
+    for link in links:
+        if should_ignore_url(link, path_prefixes, exact_keys):
+            print(f" Ignor (din DB): {link}")
+            continue
+        print(f"[~] Analizez {link}")
+        html = fetch_page_content(link)
+        if not html:
+            print("    Nu am putut încărca pagina.")
+            continue
+        text = clean_page_content(html, header_text, footer_text)
+        if len(text) < 50:
+            print("    Text prea scurt.")
+            continue
+        label = classify_page_with_llama(text, link)
+        print(f"    → Categorie: {label}")
+        results.append({"site": root_url, "url": link, "categorie": label})
+        time.sleep(1)
+    return results
+
+
+def save_results(results, filename: Path = F_REZULTATE_LLAMACOPIE):
+    filename = Path(filename)
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\nRezultatele au fost salvate în {filename.name}")
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) >= 2 and sys.argv[1]:
+        root_url = sys.argv[1].strip()
+    elif sys.stdin.isatty():
+        root_url = input("Introdu URL-ul site-ului: ").strip()
+    else:
+        print("Adauga URL-ul. Ruleaza: python analizare_site_llama_playwright.py <url>", file=sys.stderr)
+        sys.exit(2)
+    if not root_url.startswith("http://") and not root_url.startswith("https://"):
+        root_url = "https://" + root_url
+    results = analyze_site(root_url)
+    if results:
+        save_results(results)
